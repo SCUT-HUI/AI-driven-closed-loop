@@ -1,0 +1,325 @@
+import tkinter as tk
+from tkinter import filedialog
+import pandas as pd
+import numpy as np
+from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter
+import matplotlib.pyplot as plt
+import os
+import re
+import argparse
+import sys
+import traceback
+
+# ------------------- Constants -------------------
+HC = 1239.841984  # hc = 1239.841984 eV·nm
+
+def nm_to_eV(wavelength_nm):
+    return HC / wavelength_nm if wavelength_nm > 0 else np.nan
+
+def clean_wavelength_string(s):
+    if isinstance(s, (int, float)):
+        return float(s)
+    match = re.search(r'(\d+(?:\.\d+)?)', str(s))
+    if match:
+        return float(match.group(1))
+    raise ValueError(f"Cannot extract wavelength value from '{s}'")
+
+def gaussian(x, amp, mu, sigma, offset):
+    return amp * np.exp(-(x - mu) ** 2 / (2 * sigma ** 2)) + offset
+
+def compute_fwhm_gaussian(wavelength, intensity):
+    max_idx = np.argmax(intensity)
+    peak_guess = wavelength[max_idx]
+    amp_guess = intensity[max_idx] - np.min(intensity)
+    sigma_guess = (wavelength[-1] - wavelength[0]) / 10
+    offset_guess = np.min(intensity)
+
+    try:
+        popt, _ = curve_fit(gaussian, wavelength, intensity,
+                            p0=[amp_guess, peak_guess, sigma_guess, offset_guess],
+                            bounds=([0, wavelength[0], 0, -np.inf],
+                                    [np.inf, wavelength[-1], np.inf, np.inf]))
+        amp_fit, mu_fit, sigma_fit, offset_fit = popt
+        fwhm = 2.35482 * sigma_fit
+        return mu_fit, fwhm, True, popt
+    except Exception as e:
+        print(f"Gaussian fitting failed: {e}")
+        return np.nan, np.nan, False, None
+
+def compute_fwhm_linear(wavelength, intensity_norm):
+    max_idx = np.argmax(intensity_norm)
+    peak = wavelength[max_idx]
+    half_max = 0.5
+
+    # Left side
+    left_idx = np.where(intensity_norm[:max_idx+1] <= half_max)[0]
+    if len(left_idx) == 0:
+        left_pos = wavelength[0]
+    else:
+        idx = left_idx[-1]
+        if intensity_norm[idx] == half_max:
+            left_pos = wavelength[idx]
+        else:
+            x1, y1 = wavelength[idx], intensity_norm[idx]
+            x2, y2 = wavelength[idx+1], intensity_norm[idx+1]
+            left_pos = x1 + (half_max - y1) * (x2 - x1) / (y2 - y1)
+
+    # Right side
+    right_idx = np.where(intensity_norm[max_idx:] <= half_max)[0]
+    if len(right_idx) == 0:
+        right_pos = wavelength[-1]
+    else:
+        idx = right_idx[0] + max_idx
+        if intensity_norm[idx] == half_max:
+            right_pos = wavelength[idx]
+        else:
+            x1, y1 = wavelength[idx-1], intensity_norm[idx-1]
+            x2, y2 = wavelength[idx], intensity_norm[idx]
+            right_pos = x1 + (half_max - y1) * (x2 - x1) / (y2 - y1)
+
+    fwhm = right_pos - left_pos
+    return peak, fwhm
+
+def plot_spectrum(sample_name, wavelength, intensity_norm, peak_linear_nm, fwhm_linear,
+                  peak_gauss_nm, fwhm_gauss, popt, save_path=None):
+    plt.rcParams['font.family'] = 'Arial'
+    plt.figure(figsize=(10, 6))
+    plt.plot(wavelength, intensity_norm, 'bo-', markersize=4, label='Normalized PL')
+    plt.axvline(peak_linear_nm, color='gray', linestyle='--', alpha=0.7)
+    peak_linear_eV = nm_to_eV(peak_linear_nm)
+    plt.text(peak_linear_nm + 2, 0.8,
+             f'Linear: {peak_linear_nm:.1f} nm ({peak_linear_eV:.3f} eV)\nFWHM={fwhm_linear:.1f} nm',
+             fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
+    if popt is not None:
+        x_fit = np.linspace(wavelength[0], wavelength[-1], 500)
+        y_fit = gaussian(x_fit, *popt)
+        plt.plot(x_fit, y_fit, 'r-', linewidth=2, label=f'Gaussian fit (FWHM={fwhm_gauss:.1f} nm)')
+        plt.axvline(peak_gauss_nm, color='red', linestyle='--', alpha=0.7)
+        peak_gauss_eV = nm_to_eV(peak_gauss_nm)
+        plt.text(peak_gauss_nm + 2, 0.6,
+                 f'Gaussian: {peak_gauss_nm:.1f} nm ({peak_gauss_eV:.3f} eV)\nFWHM={fwhm_gauss:.1f} nm',
+                 fontsize=9, bbox=dict(facecolor='white', alpha=0.8), color='red')
+    plt.xlabel('Wavelength (nm)')
+    plt.ylabel('Normalized Intensity')
+    plt.title(f'Sample {sample_name} PL Spectrum')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Image saved to: {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+def process_spectra(filepath, smooth=False, window_length=5, polyorder=2):
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in ['.xlsx', '.xls']:
+        df = pd.read_excel(filepath, header=0, index_col=0)
+    elif ext == '.csv':
+        df = pd.read_csv(filepath, header=0, index_col=0)
+    else:
+        raise ValueError("Only .xlsx, .xls, .csv formats are supported")
+
+    # Parse wavelength columns
+    raw_wavelength_cols = df.columns.tolist()
+    wavelength = []
+    valid_cols = []
+    for col in raw_wavelength_cols:
+        try:
+            wl = clean_wavelength_string(col)
+            wavelength.append(wl)
+            valid_cols.append(col)
+        except ValueError as e:
+            print(f"Skipping invalid wavelength column '{col}': {e}")
+    if not wavelength:
+        raise ValueError("No valid wavelength columns found")
+
+    df = df[valid_cols]
+    sorted_idx = np.argsort(wavelength)
+    wavelength = np.array(wavelength)[sorted_idx]
+    df = df.iloc[:, sorted_idx]
+
+    # First pass: collect raw maximum intensity for each sample
+    sample_max_intensities = {}
+    for sample_name in df.index:
+        intensity_raw = df.loc[sample_name].values.astype(float)
+        if np.all(np.isnan(intensity_raw)) or np.nanmax(intensity_raw) <= 0:
+            print(f"Warning: sample {sample_name} has invalid intensity, skipping")
+            continue
+        max_int = np.nanmax(intensity_raw)
+        sample_max_intensities[sample_name] = max_int
+
+    if not sample_max_intensities:
+        raise ValueError("No valid sample data")
+
+    global_max_int = max(sample_max_intensities.values())
+
+    # Second pass: process each sample
+    results = []
+    for sample_name in df.index:
+        if sample_name not in sample_max_intensities:
+            continue
+
+        intensity_raw = df.loc[sample_name].values.astype(float)
+        max_int = sample_max_intensities[sample_name]
+        global_norm_intensity = max_int / global_max_int   # globally normalized peak intensity
+
+        if smooth and len(intensity_raw) >= window_length:
+            intensity_raw = savgol_filter(intensity_raw, window_length, polyorder)
+
+        intensity_norm = intensity_raw / max_int   # internally normalized for peak/FWHM
+
+        # Linear method
+        peak_linear_nm, fwhm_linear = compute_fwhm_linear(wavelength, intensity_norm)
+        peak_linear_eV = nm_to_eV(peak_linear_nm)
+
+        # Gaussian fit
+        peak_gauss_nm, fwhm_gauss, fit_ok, popt = compute_fwhm_gaussian(wavelength, intensity_norm)
+        peak_gauss_eV = nm_to_eV(peak_gauss_nm) if fit_ok else np.nan
+
+        results.append({
+            'SampleName': sample_name,
+            'Peak_Linear_nm': peak_linear_nm,
+            'Peak_Linear_eV': peak_linear_eV,
+            'FWHM_Linear_nm': fwhm_linear,
+            'Peak_Gaussian_nm': peak_gauss_nm if fit_ok else np.nan,
+            'Peak_Gaussian_eV': peak_gauss_eV,
+            'FWHM_Gaussian_nm': fwhm_gauss if fit_ok else np.nan,
+            'Gaussian_Fit_Success': fit_ok,
+            'Raw_Max_Intensity': max_int,
+            'Global_Normalized_Peak_Intensity': global_norm_intensity,
+            '_plot_data': {
+                'wavelength': wavelength.copy(),
+                'intensity_norm': intensity_norm.copy(),
+                'peak_linear_nm': peak_linear_nm,
+                'fwhm_linear': fwhm_linear,
+                'peak_gauss_nm': peak_gauss_nm if fit_ok else None,
+                'fwhm_gauss': fwhm_gauss if fit_ok else None,
+                'popt': popt if fit_ok else None,
+                'sample_name': sample_name
+            }
+        })
+
+    return pd.DataFrame(results), wavelength, df
+
+def save_results(results_df, original_filepath, overwrite=True):
+    dirname = os.path.dirname(original_filepath)
+    basename = os.path.basename(original_filepath)
+    name, ext = os.path.splitext(basename)
+    out_file = os.path.join(dirname, f"{name}_normalized.xlsx")
+
+    cols_to_save = [c for c in results_df.columns if not c.startswith('_')]
+    df_to_save = results_df[cols_to_save]
+
+    while True:
+        try:
+            if not overwrite and os.path.exists(out_file):
+                print(f"File {out_file} already exists, skipping (overwrite=False)")
+                return None
+            df_to_save.to_excel(out_file, index=False)
+            print(f"Results saved to: {out_file}")
+            return out_file
+        except PermissionError:
+            print(f"Error: File {out_file} is being used by another program (possibly opened in Excel).")
+            choice = input("Please close the file and enter 'r' to retry, or 's' to skip saving: ").strip().lower()
+            if choice == 'r':
+                continue
+            else:
+                print("Skipped saving.")
+                return None
+        except Exception as e:
+            print(f"Saving failed: {e}")
+            return None
+
+def main():
+    parser = argparse.ArgumentParser(description="PL spectrum processing (supports global normalized peak intensity)")
+    parser.add_argument('-f', '--files', nargs='+', help="Directly specify file paths (space separated)")
+    parser.add_argument('--smooth', action='store_true', help="Enable Savitzky-Golay smoothing")
+    parser.add_argument('--window', type=int, default=5, help="Smoothing window length (default 5)")
+    parser.add_argument('--polyorder', type=int, default=2, help="Polynomial order (default 2)")
+    parser.add_argument('--no-plot', action='store_true', help="Do not display plots (only save results)")
+    parser.add_argument('--save-plot', action='store_true', help="Save plots as PNG files")
+    args = parser.parse_args()
+
+    if args.files:
+        filepaths = args.files
+    else:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            filepaths = filedialog.askopenfilenames(
+                title="Select spectrum data files (multiple allowed)",
+                filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+            root.destroy()
+            if not filepaths:
+                print("No files selected, exiting.")
+                return
+        except Exception as e:
+            print(f"Unable to launch GUI file selector: {e}")
+            print("Please specify files using the -f command line argument.")
+            return
+
+    smooth = args.smooth
+    window_length = args.window
+    polyorder = args.polyorder
+    show_plots = not args.no_plot
+    save_plots = args.save_plot
+
+    success_count = 0
+    skip_save_count = 0
+    fail_count = 0
+
+    for filepath in filepaths:
+        print(f"\nProcessing: {os.path.basename(filepath)}")
+        try:
+            results_df, wavelength, raw_df = process_spectra(
+                filepath, smooth=smooth, window_length=window_length, polyorder=polyorder
+            )
+            display_cols = [c for c in results_df.columns if not c.startswith('_')]
+            print("Processing results preview (first 5 rows):")
+            print(results_df[display_cols].head().to_string())
+
+            saved_path = save_results(results_df, filepath)
+            if saved_path is not None:
+                success_count += 1
+            else:
+                skip_save_count += 1
+
+            if show_plots:
+                for idx, row in results_df.iterrows():
+                    plot_data = row.get('_plot_data')
+                    if plot_data is None:
+                        continue
+                    if save_plots:
+                        plot_dir = os.path.dirname(filepath)
+                        plot_filename = f"{os.path.splitext(os.path.basename(filepath))[0]}_{row['SampleName']}.png"
+                        plot_save_path = os.path.join(plot_dir, plot_filename)
+                    else:
+                        plot_save_path = None
+                    plot_spectrum(
+                        plot_data['sample_name'],
+                        plot_data['wavelength'],
+                        plot_data['intensity_norm'],
+                        plot_data['peak_linear_nm'],
+                        plot_data['fwhm_linear'],
+                        plot_data['peak_gauss_nm'],
+                        plot_data['fwhm_gauss'],
+                        plot_data['popt'],
+                        save_path=plot_save_path
+                    )
+                    if not save_plots and show_plots:
+                        input("Press Enter to continue to next sample...")
+            else:
+                print("Skipping plot display.")
+        except Exception as e:
+            print(f"Error processing file {filepath}: {e}")
+            traceback.print_exc()
+            fail_count += 1
+
+    print(f"\nBatch processing complete! Successfully saved: {success_count}, Skipped: {skip_save_count}, Failed: {fail_count}")
+
+if __name__ == "__main__":
+    main()
